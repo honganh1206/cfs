@@ -4,6 +4,7 @@
    https://www.gnu.org/licenses/gpl-3.0.en.html */
 
 #include <bits/getopt_core.h>
+#include <signal.h>
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -49,7 +50,30 @@ struct child_config {
 // syscalls
 // resources
 // child
-// choose_hostname
+int choose_hostname(char *buff, size_t len) {
+  static const char *suits[] = {"swords", "wands", "pentacles", "cups"};
+  static const char *minor[] = {"ace",  "two",    "three", "four", "five",
+                                "six",  "seven",  "eight", "nine", "ten",
+                                "page", "knight", "queen", "king"};
+  static const char *major[] = {
+      "fool",       "magician", "high-priestess", "empress",  "emperor",
+      "hierophant", "lovers",   "chariot",        "strength", "hermit",
+      "wheel",      "justice",  "hanged-man",     "death",    "temperance",
+      "devil",      "tower",    "star",           "moon",     "sun",
+      "judgment",   "world"};
+  struct timespec now = {0};
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  size_t ix = now.tv_nsec % 78;
+  if (ix < sizeof(major) / sizeof(*major)) {
+    snprintf(buff, len, "%05lx-%s", now.tv_sec, major[ix]);
+  } else {
+    ix -= sizeof(major) / sizeof(*major);
+    snprintf(buff, len, "%05lxc-%s-of-%s", now.tv_sec,
+             minor[ix % (sizeof(minor) / sizeof(*minor))],
+             suits[ix / (sizeof(minor) / sizeof(*minor))]);
+  }
+  return 0;
+}
 
 // ./contained -m /tmp/rootfs -u 1000 -c /bin/sh
 int main(int argc, char **argv) {
@@ -117,11 +141,53 @@ finish_options:
   fprintf(stderr, "%s on %s.\n", host.release, host.machine);
 
   char hostname[256] = {0};
-  if (choose_hostname(hostname, sizeof(hostname])))
+  if (choose_hostname(hostname, sizeof(hostname)))
     // What could go wrong here?
     goto error;
   config.hostname = hostname;
   // namespaces
+  // We use clone syscall to create a process with different props compared to
+  // the parent one, meaning mount a different /, set its own hostname, etc.
+  // Communicate with parent process via socketpair (data written to one socket
+  // can be read from the other)
+  if (socketpair(AF_LOCAL, SOCK_SEQPACKET, 0, sockets)) {
+    // Local socket, packet-like messages
+    fprintf(stderr, "socketpair failed: %m\n");
+    goto error;
+  }
+  if (fcntl(sockets[0], F_SETFD, FD_CLOEXEC)) {
+    // When parent calls exec(), automatically close sockets[0]
+    // since we do not want child to inherit parent's fd
+    fprintf(stderr, "fcntl failed: %m\n");
+    goto error;
+  }
+  config.fd = sockets[1];
+// Prepare cgroup (dedicated CPU & RAM)
+#define STACK_SIZE (1024 * 1024)
+  char *stack = 0;
+  if (!(stack = malloc(STACK_SIZE))) {
+    fprintf(stderr, "=> malloc failed, out of memory?\n");
+    goto error;
+  }
+  if (resources(&config)) {
+    err = 1;
+    goto clear_resources;
+  }
+  int flags = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWPID | CLONE_NEWIPC |
+              CLONE_NEWNET | CLONE_NEWUTS;
+
+  // Child process starts the child() function
+  // and the stack moves downward (high -> low address)
+  // and parent process waits to collect child's exit status
+  if ((child_pid =
+           clone(child, stack + STACK_SIZE, flags | SIGCHLD, &config)) == -1) {
+    fprintf(stderr, "=> clone failed! %m\n");
+    err = 1;
+    goto clear_resources;
+  }
+  // Close child's socket so we don't leave an open fd
+  close(sockets[1]);
+  sockets[1] = 0;
   goto cleanup;
 usage:
   fprintf(stderr, "Usage: %s -u -l -m . /bin/sh ~\n", argv[0]);
