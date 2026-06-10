@@ -3,10 +3,7 @@
 /* This code is licensed under the GPLv3. You can find its text here:
    https://www.gnu.org/licenses/gpl-3.0.en.html */
 
-#include <bits/getopt_core.h>
-#include <signal.h>
 #define _GNU_SOURCE
-#include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/capability.h>
@@ -17,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/capability.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -28,6 +24,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define STACK_SIZE (1024 * 1024)
+#define USERNS_OFFSET 10000
+#define USERNS_COUNT 2000
 
 struct child_config {
   // Number of command-line args after -c
@@ -49,7 +49,112 @@ struct child_config {
 // mounts
 // syscalls
 // resources
-// child
+
+// Parent process configures the child user's namespace (userns)
+int handle_child_uid_map(pid_t child_pid, int fd) {
+  int uid_map = 0;
+  int has_userns = -1;
+  // Read from the child proc whether it created/uses a user namespace
+  if (read(fd, &has_userns, sizeof(has_userns)) != sizeof(has_userns)) {
+    fprintf(stderr, "couldn't read from child!\n");
+    return -1;
+  }
+  // If non-zero then parent must writes UID/GID maps
+  if (has_userns) {
+    char path[PATH_MAX] = {0};
+    // Loop over two proc files and write to both
+    for (char **file = (char *[]){"uid_map", "gid_map", 0}; *file; file++) {
+      if (snprintf(path, sizeof(path), "/proc/%d/%s", child_pid, *file) >
+          sizeof(path)) {
+        fprintf(stderr, "snprintf too big? %m\n");
+        return -1;
+      }
+      fprintf(stderr, "writing %s...", path);
+      // Open UID/GID maps to write
+      if ((uid_map = open(path, O_WRONLY)) == -1) {
+        fprintf(stderr, "open failed: %m\n");
+        return -1;
+      }
+      // Write inside namespace UID/GID to outside namespace UID/GID 10000
+      if (dprintf(uid_map, "0 %d %d\n", USERNS_OFFSET, USERNS_COUNT) == -1) {
+        // something like 0 100000 65536
+        fprintf(stderr, "dprintf failed: %m\n");
+        close(uid_map);
+        return -1;
+      }
+      close(uid_map);
+    }
+  }
+  // Writing done, child can continue
+  // since child is probably blocked by parent writing to maps
+  if (write(fd, &(int){0}, sizeof(int)) != sizeof(int)) {
+    fprintf(stderr, "couldn't write: %m\n");
+    return -1;
+  }
+  return 0;
+}
+
+// Enter a new user namespace (running in child process).
+// After the parent process is done writing UID/GID maps,
+// switch the child process to the requested UID/GID.
+int userns(struct child_config *config) {
+  fprintf(stderr, "=> trying a user namespace...");
+  // Disassociate parts of the execution context (like namespaces)
+  // of child process from parent process
+  int has_userns = !unshare(CLONE_NEWUSER);
+  if (write(config->fd, &has_userns, sizeof(has_userns)) !=
+      sizeof(has_userns)) {
+    fprintf(stderr, "couldn't write: %m\n");
+    return -1;
+  }
+  int result = 0;
+  if (read(config->fd, &result, sizeof(result)) != sizeof(result)) {
+    fprintf(stderr, "couldn't read: %m\n");
+    return -1;
+  }
+  if (result)
+    return -1;
+  if (has_userns) {
+    fprintf(stderr, "done.\n");
+  } else {
+    fprintf(stderr, "unsupported? continuing.\n");
+  }
+  fprintf(stderr, "=> switching to uid %d / gid %d...", config->uid,
+          config->uid);
+  if (setgroups(1, &(gid_t){config->uid}) ||
+      setresgid(config->uid, config->uid, config->uid) ||
+      setresuid(config->uid, config->uid, config->uid)) {
+    // Save real user ID? effective group ID? saved-set ID?
+    fprintf(stderr, "%m\n");
+    return -1;
+  }
+  fprintf(stderr, "done.\n");
+  return 0;
+}
+
+// Entry point for the cloned child process
+int child(void *arg) {
+  struct child_config *config = arg;
+  // NOTE: The order is important.
+  // We perform setup, switch user and group, load the executables
+  if (sethostname(config->hostname, strlen(config->hostname)) ||
+      mounts(config) || userns(config) || capabilities() || syscalls()) {
+    close(config->fd);
+    return -1;
+  }
+  if (close(config->fd)) {
+    fprintf(stderr, "close failed: %m\n");
+    return -1;
+  }
+  // Replace the parent process (running this program) with the child process
+  // and carry the argv and envp to the child process
+  if (execve(config->argv[0], config->argv, NULL)) {
+    fprintf(stderr, "execve failed! %m\n");
+    return -1;
+  }
+  return 0;
+}
+
 int choose_hostname(char *buff, size_t len) {
   static const char *suits[] = {"swords", "wands", "pentacles", "cups"};
   static const char *minor[] = {"ace",  "two",    "three", "four", "five",
@@ -162,8 +267,7 @@ finish_options:
     goto error;
   }
   config.fd = sockets[1];
-// Prepare cgroup (dedicated CPU & RAM)
-#define STACK_SIZE (1024 * 1024)
+  // Prepare cgroup (dedicated CPU & RAM)
   char *stack = 0;
   if (!(stack = malloc(STACK_SIZE))) {
     fprintf(stderr, "=> malloc failed, out of memory?\n");
