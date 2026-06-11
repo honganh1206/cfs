@@ -4,6 +4,7 @@
    https://www.gnu.org/licenses/gpl-3.0.en.html */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/capability.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/capability.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -46,7 +48,154 @@ struct child_config {
 };
 
 // capabilities
+int capabilities() {
+  fprintf(stderr, "=> dropping capabilities...");
+  int drop_caps[] = {// Kernel audit system: configure/read/write audit logs.
+                     CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE,
+                     // Host power management: prevent suspend.
+                     CAP_BLOCK_SUSPEND,
+                     // Bypass file read and directory search permission checks.
+                     CAP_DAC_READ_SEARCH,
+
+                     // Preserve setuid/setgid bits when modifying files.
+                     CAP_FSETID,
+
+                     // Lock memory beyond normal limits.
+                     CAP_IPC_LOCK,
+
+                     // Mandatory Access Control administration/override powers.
+                     CAP_MAC_ADMIN, CAP_MAC_OVERRIDE,
+
+                     // Create device nodes.
+                     CAP_MKNOD,
+
+                     // Set file capabilities on executables.
+                     CAP_SETFCAP,
+
+                     // Privileged kernel log/syslog operations.
+                     CAP_SYSLOG,
+
+                     // Broad administrative power; heavily overloaded.
+                     CAP_SYS_ADMIN,
+
+                     // Reboot or related boot operations.
+                     CAP_SYS_BOOT,
+
+                     // Load/unload kernel modules.
+                     CAP_SYS_MODULE,
+
+                     // Raise scheduling priority / real-time scheduling powers.
+                     CAP_SYS_NICE,
+
+                     // Raw I/O and low-level device/memory access.
+                     CAP_SYS_RAWIO,
+
+                     // Override resource limits and quotas.
+                     CAP_SYS_RESOURCE,
+
+                     // Set system clock.
+                     CAP_SYS_TIME,
+
+                     // Wake system from suspend.
+                     CAP_WAKE_ALARM};
+
+  size_t num_caps = sizeof(drop_caps) / sizeof(*drop_caps);
+
+  // Give bounding set
+  fprintf(stderr, "bounding...");
+  for (size_t i = 0; i < num_caps; i++) {
+    if (prctl(PR_CAPBSET_DROP, drop_caps[i], 0, 0, 0)) {
+      fprintf(stderr, "prctl failed: %m\n");
+      return 1;
+    }
+  }
+
+  // Give inheritable set
+  fprintf(stderr, "inheritable...");
+  // Set capabilities to child proc?
+  cap_t caps = NULL;
+  if (!(caps = cap_get_proc()) ||
+      cap_set_flag(caps, CAP_INHERITABLE, num_caps, drop_caps, CAP_CLEAR) ||
+      cap_set_proc(caps)) {
+    fprintf(stderr, "failed: %m\n");
+    if (caps)
+      cap_free(caps);
+    return 1;
+  }
+  cap_free(caps);
+  fprintf(stderr, "done\n");
+  return 0;
+}
+
+
+// Swap the mount at "/" with another
+int pivot_root(const char *new_root, const char *put_old) {
+  return syscall(SYS_pivot_root, new_root, put_old);
+}
+
 // mounts
+// Child process in its own mount namespace, so we need to unmount things it
+// should not have access to like the host's system tree
+int mounts(struct child_config *config) {
+  fprintf(stderr, "=> remounting everything with MS_PRIVATE...");
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+    fprintf(stderr, "failed! %m\n");
+    return -1;
+  }
+  fprintf(stderr, "remounted\n");
+
+  // Bind-mount new root for child proc to rootfs passed in as arg
+  // /tmp/tmp.XXXXXX -> /home/user/rootfs
+  fprintf(stderr, "=> making a temp directory and a bind mount there...");
+  // Host can see this dir, but it will be the contained process' root FS "/"
+  char mount_dir[] = "/tmp/tmp.XXXXXX";
+  if (!mkdtemp(mount_dir)) {
+    fprintf(stderr, "failed making a directory\n");
+    return -1;
+  }
+  if (mount(config->mount_dir, mount_dir, NULL, MS_BIND | MS_PRIVATE, NULL)) {
+    fprintf(stderr, "bind mount failed\n");
+  }
+
+  char inner_mount_dir[] = "/tmp/tmp.XXXXXX/oldroot.XXXXXX";
+  // Copy the host's FS to oldroot
+  memcpy(inner_mount_dir, mount_dir, sizeof(mount_dir) - 1);
+  if (!mkdtemp(inner_mount_dir)) {
+    fprintf(stderr, "failed making the inner directory\n");
+    return -1;
+  }
+  fprintf(stderr, "done\n");
+
+  fprintf(stderr, "=> pivoting root...");
+  if (pivot_root(mount_dir, inner_mount_dir)) {
+    fprintf(stderr, "failed\n");
+    return -1;
+  }
+
+  fprintf(stderr, "done\n");
+
+  // Prepare to unmount the host FS (old root) and remove it
+  char *old_root_dir = basename(inner_mount_dir);
+  char old_root[sizeof(inner_mount_dir) + 1] = {"/"};
+  strcpy(&old_root[1], old_root_dir);
+
+  fprintf(stderr, "=> unmounting %s...", old_root);
+  if (chdir("/")) {
+    // Change PWD
+    fprintf(stderr, "chdir failed %m\n");
+    return -1;
+  }
+  if (umount2(old_root, MNT_DETACH)) {
+    fprintf(stderr, "umount failed %m\n");
+    return -1;
+  }
+  if (rmdir(old_root)) {
+    return -1;
+    fprintf(stderr, "rmdir failed %m\n");
+  }
+  fprintf(stderr, "done\n");
+  return 0;
+}
 // syscalls
 // resources
 
@@ -146,8 +295,8 @@ int child(void *arg) {
     fprintf(stderr, "close failed: %m\n");
     return -1;
   }
-  // Replace the parent process (running this program) with the child process
-  // and carry the argv and envp to the child process
+  // Replace the current process with /bin/sh?
+  // and pass the argv and envp to it
   if (execve(config->argv[0], config->argv, NULL)) {
     fprintf(stderr, "execve failed! %m\n");
     return -1;

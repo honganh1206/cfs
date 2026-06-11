@@ -1,1 +1,1 @@
-Allocate stack memory -> Parent process writes UID/GID map -> Clone child process and wait for exit status ->?
+Allocate stack memory -> Parent process writes UID/GID map -> Clone child process and wait for exit status -> set host name -> mount the new root e.g., rootfs to contained process & remove old root (host's) to prevent access -> give child process user namespace -> harden capabilities -> perform syscalls?
