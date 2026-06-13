@@ -12,6 +12,7 @@
 #include <pwd.h>
 #include <sched.h>
 #include <seccomp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,15 @@
 #define STACK_SIZE (1024 * 1024)
 #define USERNS_OFFSET 10000
 #define USERNS_COUNT 2000
+#define SCMP_FAIL SCMP_ACT_ERRNO(EPERM)
+// No more than 1GB in userspace
+#define MEMORY "104857600"
+// A quarter of CPU time on a busy system at most (Is this vCPU?)
+#define SHARES "25"
+// Contained process has 64 PIDs at most
+#define PIDS "64"
+#define WEIGHTS "10"
+#define FD_COUNT 64
 
 struct child_config {
   // Number of command-line args after -c
@@ -47,7 +57,6 @@ struct child_config {
   char *mount_dir;
 };
 
-// capabilities
 int capabilities() {
   fprintf(stderr, "=> dropping capabilities...");
   int drop_caps[] = {// Kernel audit system: configure/read/write audit logs.
@@ -127,13 +136,11 @@ int capabilities() {
   return 0;
 }
 
-
 // Swap the mount at "/" with another
 int pivot_root(const char *new_root, const char *put_old) {
   return syscall(SYS_pivot_root, new_root, put_old);
 }
 
-// mounts
 // Child process in its own mount namespace, so we need to unmount things it
 // should not have access to like the host's system tree
 int mounts(struct child_config *config) {
@@ -196,8 +203,171 @@ int mounts(struct child_config *config) {
   fprintf(stderr, "done\n");
   return 0;
 }
-// syscalls
-// resources
+
+// Blacklist syscalls that lead to harms like sandbox escapes.
+int syscalls() {
+  scmp_filter_ctx ctx = NULL;
+  fprintf(stderr, "=> filtering syscalls...");
+  // Seccomp system filter
+  if (!(ctx = seccomp_init(SCMP_ACT_ALLOW))
+      // Filter context, action on the dangerous syscall, syscall num, sycall
+      // args
+      // Prevent setuid/setgid
+      // since a contained process without namespace could be used by any user
+      // to get root
+      || seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(chmod), 1,
+                          SCMP_A1(SCMP_CMP_MASKED_EQ, S_ISUID, S_ISUID)) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(chmod), 1,
+                       SCMP_A1(SCMP_CMP_MASKED_EQ, S_ISGID, S_ISGID)) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(fchmod), 1,
+                       SCMP_A1(SCMP_CMP_MASKED_EQ, S_ISUID, S_ISUID)) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(fchmod), 1,
+                       SCMP_A1(SCMP_CMP_MASKED_EQ, S_ISGID, S_ISGID)) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(fchmodat), 1,
+                       SCMP_A2(SCMP_CMP_MASKED_EQ, S_ISUID, S_ISUID)) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(fchmodat), 1,
+                       SCMP_A2(SCMP_CMP_MASKED_EQ, S_ISGID, S_ISGID)) ||
+      // Contained process can start new namespace and gain caps
+      seccomp_rule_add(
+          ctx, SCMP_FAIL, SCMP_SYS(unshare), 1,
+          SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, CLONE_NEWUSER)) ||
+      seccomp_rule_add(
+          ctx, SCMP_FAIL, SCMP_SYS(clone), 1,
+          SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, CLONE_NEWUSER))
+      // Contained process can write to controlling terminal
+      || seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(ioctl), 1,
+                          SCMP_A1(SCMP_CMP_MASKED_EQ, TIOCSTI, TIOCSTI)) ||
+      // Kernel keyring system (store keys/tokens/certs in kernel memory)
+      // isn't namespaced
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(keyctl), 0) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(add_key), 0) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(request_key), 0) ||
+      // ptrace (Linux debugging/tracing mechanism) can modify what syscall
+      // a process is about to make (before Linux 4.8 only?)
+      // because it can write new values into CPU registers??
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(ptrace), 0)
+      // Prevent contained processes assign NUMA nodes (large servers have
+      // non-unified memory access)
+      // that can deny service to NUMA-aware application on the host
+      || seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(mbind), 0) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(migrate_pages), 0) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(move_pages), 0) ||
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(set_mempolicy), 0) ||
+      // Pause execution in the kernel
+      // by triggering page faults (memory mapped in virtual address but not
+      // loaded to RAM) in system calls
+      seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(userfaultfd), 0)
+      // (Potentially) leak information on the host
+      || seccomp_rule_add(ctx, SCMP_FAIL, SCMP_SYS(perf_event_open), 0)
+      // Do not automatically enable no_new_privs (safety switch to not gain
+      // extra privileges) but some commands like ping needs this to send
+      // network packets
+      || seccomp_attr_set(ctx, SCMP_FLTATR_CTL_NNP, 0) || seccomp_load(ctx)) {
+    if (ctx)
+      seccomp_release(ctx);
+    fprintf(stderr, "failed: %m\n");
+    return 1;
+  }
+  seccomp_release(ctx);
+  fprintf(stderr, "done\n");
+  return 0;
+}
+
+// Helper function to DRY open()/write()
+int write_file(const char *path, const char *value) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+
+  if (fd == -1) {
+    fprintf(stderr, "open %s failed: %m\n", path);
+    return -1;
+  }
+
+  ssize_t len = (ssize_t)strlen(value);
+
+  if (write(fd, value, len) != len) {
+    fprintf(stderr, "write %s failed: %m\n", path);
+    close(fd);
+    return -1;
+  }
+
+  close(fd);
+  return 0;
+}
+
+int resources(pid_t child_pid) {
+  char cgroup_dir[PATH_MAX];
+  char path[PATH_MAX];
+  char pidbuf[32];
+
+  fprintf(stderr, "=> setting cgroup v2 limits...");
+
+  snprintf(cgroup_dir, sizeof(cgroup_dir), "/sys/fs/cgroup/contained-%d",
+           child_pid);
+
+  if (mkdir(cgroup_dir, 0700) == -1 && errno != EEXIST) {
+    fprintf(stderr, "mkdir %s failed: %m\n", cgroup_dir);
+    return -1;
+  }
+
+  if (snprintf(path, sizeof(path), "%s/memory.max", cgroup_dir) == -1)
+    return -1;
+
+  if (write_file(path, MEMORY) == -1)
+    return -1;
+
+  /*
+   * pids.max:
+   * Maximum number of processes in this cgroup.
+   */
+  if (snprintf(path, sizeof(path), "%s/pids.max", cgroup_dir) == -1)
+    return -1;
+
+  if (write_file(path, PIDS) == -1)
+    return -1;
+
+  /*
+   * cpu.weight
+   * Relative CPU priority.
+   */
+  if (snprintf(path, sizeof(path), "%s/cpu.weight", cgroup_dir) == -1)
+    return -1;
+  if (write_file(path, SHARES) == -1)
+    return -1;
+
+  /*
+   * Move the child process into this cgroup.
+   */
+  if (snprintf(pidbuf, sizeof(pidbuf), "%d", child_pid) == -1)
+    return -1;
+  ;
+
+  if (snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_dir) == -1)
+    return -1;
+  if (write_file(path, pidbuf) == -1)
+    return -1;
+
+  fprintf(stderr, "done.\n");
+
+  return 0;
+}
+
+int free_resources(pid_t child_pid) {
+  char cgroup_dir[PATH_MAX];
+
+  fprintf(stderr, "=> cleaning cgroup v2...");
+
+  if (snprintf(cgroup_dir, sizeof(cgroup_dir), "/sys/fs/cgroup/contained-%d",
+               child_pid) == -1)
+    return -1;
+
+  if (rmdir(cgroup_dir) == -1) {
+    fprintf(stderr, "rmdir %s failed: %m\n", cgroup_dir);
+    return -1;
+  }
+
+  fprintf(stderr, "done.\n");
+  return 0;
+}
 
 // Parent process configures the child user's namespace (userns)
 int handle_child_uid_map(pid_t child_pid, int fd) {
@@ -218,7 +388,7 @@ int handle_child_uid_map(pid_t child_pid, int fd) {
         fprintf(stderr, "snprintf too big? %m\n");
         return -1;
       }
-      fprintf(stderr, "writing %s...", path);
+      fprintf(stderr, "=> writing %s...", path);
       // Open UID/GID maps to write
       if ((uid_map = open(path, O_WRONLY)) == -1) {
         fprintf(stderr, "open failed: %m\n");
@@ -337,9 +507,12 @@ int main(int argc, char **argv) {
   int sockets[2] = {0};
   pid_t child_pid = 0;
   int last_optind = 0;
+  int cgroup_v2_configured = 0;
+  int kill_child_on_finish = 0;
+  int child_status = 0;
 
   // Parse command-line options
-  while ((option = getopt(argc, argv, "c:m:u"))) {
+  while ((option = getopt(argc, argv, "c:m:u:"))) {
     switch (option) {
     case 'c':
       // Calculate number of args
@@ -383,11 +556,6 @@ finish_options:
     fprintf(stderr, "weird release format: %s\n", host.release);
     goto cleanup;
   }
-  // Why this specific version?
-  if (major != 4 || (minor != 7 && minor != 8)) {
-    fprintf(stderr, "expected 4.7.x or 4.8.x: %s\n", host.release);
-    goto cleanup;
-  }
   if (strcmp("x86_64", host.machine)) {
     fprintf(stderr, "expected x886_64: %s\n", host.machine);
     goto cleanup;
@@ -422,25 +590,52 @@ finish_options:
     fprintf(stderr, "=> malloc failed, out of memory?\n");
     goto error;
   }
-  if (resources(&config)) {
-    err = 1;
-    goto clear_resources;
-  }
-  int flags = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWPID | CLONE_NEWIPC |
-              CLONE_NEWNET | CLONE_NEWUTS;
+
+  int flags =
+      CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWUTS;
 
   // Child process starts the child() function
   // and the stack moves downward (high -> low address)
   // and parent process waits to collect child's exit status
-  if ((child_pid =
-           clone(child, stack + STACK_SIZE, flags | SIGCHLD, &config)) == -1) {
+  child_pid = clone(child, stack + STACK_SIZE, flags | SIGCHLD, &config);
+  if (child_pid == -1) {
     fprintf(stderr, "=> clone failed! %m\n");
     err = 1;
     goto clear_resources;
   }
+  if (resources(child_pid) == -1) {
+    fprintf(stderr, "failed to set cgroup resources\n");
+    err = 1;
+    kill_child_on_finish = 1;
+    goto finish_child;
+  }
+  cgroup_v2_configured = 1;
+
   // Close child's socket so we don't leave an open fd
   close(sockets[1]);
   sockets[1] = 0;
+
+  if (handle_child_uid_map(child_pid, sockets[0]) == -1) {
+    fprintf(stderr, "failed to configure user namespace\n");
+    err = 1;
+    kill_child_on_finish = 1;
+  }
+
+finish_child:
+  if (kill_child_on_finish && child_pid)
+    kill(child_pid, SIGKILL);
+  if (waitpid(child_pid, &child_status, 0) == -1) {
+    fprintf(stderr, "waitpid failed: %m\n");
+    err = 1;
+  } else if (WIFEXITED(child_status)) {
+    err |= WEXITSTATUS(child_status);
+  } else if (WIFSIGNALED(child_status) && !err) {
+    err = 128 + WTERMSIG(child_status);
+  }
+clear_resources:
+  free(stack);
+  if (cgroup_v2_configured)
+    free_resources(child_pid);
   goto cleanup;
 usage:
   fprintf(stderr, "Usage: %s -u -l -m . /bin/sh ~\n", argv[0]);
