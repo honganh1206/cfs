@@ -39,6 +39,15 @@ The simplest cgroup v2 path is used for now: the child is moved into a cgroup
 after `clone()`. The program does not currently try to make the cgroup namespace
 view line up with the created cgroup.
 
+There is a small race in this learning version: after `clone()`, the child is
+schedulable before the parent has finished creating the cgroup and writing the
+child PID to `cgroup.procs`. In practice, the child blocks later during the user
+namespace handshake before it reaches `execve()`, so the requested command should
+start after the cgroup is ready. Early child setup work, such as hostname and
+mount setup, can still run before cgroup placement. A stricter implementation
+would add an initial child-start barrier so the parent can finish cgroup setup
+before the child performs any setup work.
+
 ## Build
 
 Install build dependencies on Debian or Ubuntu:
@@ -51,7 +60,7 @@ sudo apt-get install -y build-essential libcap-dev libseccomp-dev
 Build the binary:
 
 ```sh
-gcc -Wall -Werror contained.c -o contained -lcap -lseccomp
+make
 ```
 
 ## Create a BusyBox root filesystem for testing
